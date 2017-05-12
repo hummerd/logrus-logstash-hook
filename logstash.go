@@ -1,15 +1,36 @@
 package logrus_logstash
 
 import (
+	"bytes"
 	"net"
+	"os"
 	"strings"
+	"sync"
 
 	"github.com/Sirupsen/logrus"
 )
 
+var (
+	entryChan  chan sendMessage    = make(chan sendMessage, 1000)
+	formatBuff sync.Pool           = sync.Pool{New: func() interface{} { return &bytes.Buffer{} }}
+	connPool   map[string]net.Conn = make(map[string]net.Conn, 1)
+)
+
+func init() {
+	go processEntryData(entryChan)
+}
+
+type sendMessage struct {
+	protocol string
+	address  string
+	data     *bytes.Buffer
+}
+
 // Hook represents a connection to a Logstash instance
 type Hook struct {
-	conn             net.Conn
+	protocol         string
+	address          string
+	filtering        bool
 	appName          string
 	alwaysSentFields logrus.Fields
 	hookOnlyPrefix   string
@@ -17,39 +38,19 @@ type Hook struct {
 
 // NewHook creates a new hook to a Logstash instance, which listens on
 // `protocol`://`address`.
-func NewHook(protocol, address, appName string) (*Hook, error) {
+func NewHook(protocol, address, appName string) *Hook {
 	return NewHookWithFields(protocol, address, appName, make(logrus.Fields))
-}
-
-// NewHookWithConn creates a new hook to a Logstash instance, using the supplied connection
-func NewHookWithConn(conn net.Conn, appName string) (*Hook, error) {
-	return NewHookWithFieldsAndConn(conn, appName, make(logrus.Fields))
 }
 
 // NewHookWithFields creates a new hook to a Logstash instance, which listens on
 // `protocol`://`address`. alwaysSentFields will be sent with every log entry.
-func NewHookWithFields(protocol, address, appName string, alwaysSentFields logrus.Fields) (*Hook, error) {
+func NewHookWithFields(protocol, address, appName string, alwaysSentFields logrus.Fields) *Hook {
 	return NewHookWithFieldsAndPrefix(protocol, address, appName, alwaysSentFields, "")
 }
 
-// NewHookWithFieldsAndPrefix creates a new hook to a Logstash instance, which listens on
-// `protocol`://`address`. alwaysSentFields will be sent with every log entry. prefix is used to select fields to filter
-func NewHookWithFieldsAndPrefix(protocol, address, appName string, alwaysSentFields logrus.Fields, prefix string) (*Hook, error) {
-	conn, err := net.Dial(protocol, address)
-	if err != nil {
-		return nil, err
-	}
-	return NewHookWithFieldsAndConnAndPrefix(conn, appName, alwaysSentFields, prefix)
-}
-
-// NewHookWithFieldsAndConn creates a new hook to a Logstash instance using the supplied connection
-func NewHookWithFieldsAndConn(conn net.Conn, appName string, alwaysSentFields logrus.Fields) (*Hook, error) {
-	return NewHookWithFieldsAndConnAndPrefix(conn, appName, alwaysSentFields, "")
-}
-
 //NewHookWithFieldsAndConnAndPrefix creates a new hook to a Logstash instance using the suppolied connection and prefix
-func NewHookWithFieldsAndConnAndPrefix(conn net.Conn, appName string, alwaysSentFields logrus.Fields, prefix string) (*Hook, error) {
-	return &Hook{conn: conn, appName: appName, alwaysSentFields: alwaysSentFields, hookOnlyPrefix: prefix}, nil
+func NewHookWithFieldsAndPrefix(protocol, address, appName string, alwaysSentFields logrus.Fields, prefix string) *Hook {
+	return &Hook{protocol: protocol, address: address, filtering: false, appName: appName, alwaysSentFields: alwaysSentFields, hookOnlyPrefix: prefix}
 }
 
 //NewFilterHook makes a new hook which does not forward to logstash, but simply enforces the prefix rules
@@ -59,7 +60,7 @@ func NewFilterHook() *Hook {
 
 //NewFilterHookWithPrefix make a new hook which does not forward to logstash, but simply enforces the specified prefix
 func NewFilterHookWithPrefix(prefix string) *Hook {
-	return &Hook{conn: nil, appName: "", alwaysSentFields: make(logrus.Fields), hookOnlyPrefix: prefix}
+	return &Hook{filtering: true, appName: "", alwaysSentFields: make(logrus.Fields), hookOnlyPrefix: prefix}
 }
 
 func (h *Hook) filterHookOnly(entry *logrus.Entry) {
@@ -70,7 +71,6 @@ func (h *Hook) filterHookOnly(entry *logrus.Entry) {
 			}
 		}
 	}
-
 }
 
 //WithPrefix sets a prefix filter to use in all subsequent logging
@@ -101,19 +101,23 @@ func (h *Hook) Fire(entry *logrus.Entry) error {
 	}
 
 	//For a filteringHook, stop here
-	if h.conn == nil {
+	if h.filtering {
 		return nil
 	}
 
-	formatter := LogstashFormatter{Type: h.appName}
+	buff := getFormatBuf()
 
-	dataBytes, err := formatter.FormatWithPrefix(entry, h.hookOnlyPrefix)
+	writer := LogstashWriter{Type: h.appName}
+	err := writer.WriteWithPrefix(buff, entry, h.hookOnlyPrefix)
 	if err != nil {
 		return err
 	}
-	if _, err = h.conn.Write(dataBytes); err != nil {
-		return err
+
+	select {
+	case entryChan <- sendMessage{h.protocol, h.address, buff}:
+	default:
 	}
+
 	return nil
 }
 
@@ -126,4 +130,37 @@ func (h *Hook) Levels() []logrus.Level {
 		logrus.InfoLevel,
 		logrus.DebugLevel,
 	}
+}
+
+func getFormatBuf() *bytes.Buffer {
+	b := formatBuff.Get().(*bytes.Buffer)
+	b.Reset()
+	return b
+}
+
+func processEntryData(data chan sendMessage) {
+	for d := range data {
+		_, err := sendDataAndRetry(d)
+		formatBuff.Put(d.data)
+		if err != nil {
+			os.Stderr.WriteString("Error sending data to logstash: " + err.Error())
+		}
+	}
+}
+
+func sendDataAndRetry(data sendMessage) (int, error) {
+	conn := connPool[data.protocol+":"+data.address]
+	if conn != nil {
+		if n, err := conn.Write(data.data.Bytes()); err == nil {
+			return n, err
+		}
+	}
+
+	conn, err := net.Dial(data.protocol, data.address)
+	if err != nil {
+		return 0, err
+	}
+
+	connPool[data.protocol+":"+data.address] = conn
+	return conn.Write(data.data.Bytes())
 }

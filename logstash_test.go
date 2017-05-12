@@ -9,63 +9,43 @@ import (
 	"testing"
 	"time"
 
+	"runtime"
+
 	"github.com/Sirupsen/logrus"
 )
 
+var (
+	protocol string = "udp"
+	address  string = "localhost:9999"
+)
+
 func TestLegostashHook(t *testing.T) {
-	type Expct struct {
+	type Expect struct {
 		appName          string
 		hookOnlyPrefix   string
 		alwaysSentFields logrus.Fields
 	}
 	tt := []struct {
-		expected Expct
-		initFunc func() (*Hook, error)
+		expected Expect
+		initFunc func() *Hook
 	}{
-		{Expct{"bla", "", nil}, func() (*Hook, error) {
-			return NewHook("udp", "localhost:9999", "bla")
+		{Expect{"bla", "", nil}, func() *Hook {
+			return NewHook(protocol, address, "bla")
 		}},
-		{Expct{"bzz", "", nil}, func() (*Hook, error) {
-			udpConn, err := net.Dial("udp", "localhost:9999")
-			if err != nil {
-				return nil, err
-			}
-			return NewHookWithConn(udpConn, "bzz")
+		{Expect{"blk", "", logrus.Fields{"id": 1}}, func() *Hook {
+			return NewHookWithFields(protocol, address, "blk", logrus.Fields{"id": 1})
 		}},
-		{Expct{"blk", "", logrus.Fields{"id": 1}}, func() (*Hook, error) {
-			return NewHookWithFields("udp", "localhost:9999", "blk", logrus.Fields{"id": 1})
-		}},
-		{Expct{"prefix", "-->", logrus.Fields{"id": 1}}, func() (*Hook, error) {
-			return NewHookWithFieldsAndPrefix("udp", "localhost:9999", "prefix", logrus.Fields{"id": 1}, "-->")
-		}},
-		{Expct{"fieldsconn", "", logrus.Fields{"id": 5}}, func() (*Hook, error) {
-			udpConn, err := net.Dial("udp", "localhost:9999")
-			if err != nil {
-				return nil, err
-			}
-			return NewHookWithFieldsAndConn(udpConn, "fieldsconn", logrus.Fields{"id": 5})
-		}},
-		{Expct{"zz", "~~>", logrus.Fields{"id": "bal"}}, func() (*Hook, error) {
-			udpConn, err := net.Dial("udp", "localhost:9999")
-			if err != nil {
-				return nil, err
-			}
-			return NewHookWithFieldsAndConnAndPrefix(udpConn, "zz", logrus.Fields{"id": "bal"}, "~~>")
+		{Expect{"prefix", "-->", logrus.Fields{"id": 1}}, func() *Hook {
+			return NewHookWithFieldsAndPrefix(protocol, address, "prefix", logrus.Fields{"id": 1}, "-->")
 		}},
 	}
 
 	for _, te := range tt {
-		h, err := te.initFunc()
-		if err != nil {
-			t.Error(err)
-		}
+		h := te.initFunc()
 		if h == nil {
 			t.Error("expected hook to be not nil")
 		}
 
-		if h.conn == nil {
-			t.Error("expected conn to be not nil")
-		}
 		if h.appName != te.expected.appName {
 			t.Errorf("expected appName to be '%s' but got '%s'", te.expected.appName, h.appName)
 		}
@@ -100,9 +80,6 @@ func TestNewFiltering(t *testing.T) {
 
 	for _, te := range tt {
 		h := te.initFunc()
-		if h.conn != nil {
-			t.Error("expected conn to be nil")
-		}
 		if h.alwaysSentFields == nil {
 			t.Error("expected alwaysSentFields to be not nil")
 		}
@@ -223,8 +200,13 @@ func (c ConnMock) SetWriteDeadline(t time.Time) error {
 
 func TestFire(t *testing.T) {
 	conn := ConnMock{buff: bytes.NewBufferString("")}
+
+	connPool = map[string]net.Conn{
+		protocol + ":" + address: conn}
+
 	hook := &Hook{
-		conn:             conn,
+		protocol:         protocol,
+		address:          address,
 		appName:          "fire_test",
 		alwaysSentFields: logrus.Fields{"test-name": "fire-test", "->ignore": "haaa", "override": "no"},
 		hookOnlyPrefix:   "->",
@@ -237,6 +219,7 @@ func TestFire(t *testing.T) {
 	if err := hook.Fire(entry); err != nil {
 		t.Error(err)
 	}
+	runtime.Gosched()
 	var res map[string]string
 	if err := json.NewDecoder(conn.buff).Decode(&res); err != nil {
 		t.Error(err)
@@ -258,6 +241,8 @@ func TestFire(t *testing.T) {
 
 func TestFireFilterHook(t *testing.T) {
 	hook := &Hook{
+		protocol:         protocol,
+		address:          address,
 		appName:          "fire_hook_test",
 		alwaysSentFields: logrus.Fields{"test-name": "fire-test-hook", "_ignore": "haaa", "override": "no"},
 		hookOnlyPrefix:   "_",
