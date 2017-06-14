@@ -6,7 +6,7 @@ import (
 	"io"
 	"strings"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 )
 
 // Formatter generates json in logstash format.
@@ -33,7 +33,7 @@ func (w *LogstashWriter) WriteWithPrefix(writer io.Writer, entry *logrus.Entry, 
 		switch v := v.(type) {
 		case error:
 			// Otherwise errors are ignored by `encoding/json`
-			// https://github.com/Sirupsen/logrus/issues/377
+			// https://github.com/sirupsen/logrus/issues/377
 			fields[k] = v.Error()
 		default:
 			fields[k] = v
