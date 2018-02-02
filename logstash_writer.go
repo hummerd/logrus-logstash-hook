@@ -45,7 +45,7 @@ func (w *LogstashWriter) WriteWithPrefix(writer io.Writer, entry *logrus.Entry, 
 	timeStampFormat := w.TimestampFormat
 
 	if timeStampFormat == "" {
-		timeStampFormat = logrus.DefaultTimestampFormat
+		timeStampFormat = defaultTimestampFormat
 	}
 
 	fields["@timestamp"] = entry.Time.Format(timeStampFormat)
